@@ -1,0 +1,27 @@
+- name: Step 1 - Validate Namespace and Export Stats
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check if the target namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ user_namespace }}"
+      register: ns_check
+
+    - name: Terminate if namespace is already present
+      ansible.builtin.fail:
+        msg: "Conflict: Namespace {{ user_namespace }} already exists in the cluster."
+      when: ns_check.resources | length > 0
+
+    - name: Push variables to the Workflow artifact
+      ansible.builtin.set_stats:
+        data:
+          shared_namespace: "{{ user_namespace }}"
+          shared_vms:
+            - "{{ postgresql_vm_name }}"
+            - "{{ apache_vm_name }}"
+            - "{{ weblogic_vm_name }}"
+          shared_date: "{{ request_date }}"
+          shared_user: "{{ requester_username }}"
