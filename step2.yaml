@@ -1,0 +1,84 @@
+- name: Step 2 - Provision Namespace, RBAC, and Fedora VMs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create the new project Namespace
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ shared_namespace }}"
+        state: present
+
+    - name: Bind 'edit' ClusterRole to the requester
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: user-namespace-manager
+            namespace: "{{ shared_namespace }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: edit
+          subjects:
+            - kind: User
+              name: "{{ shared_user }}"
+
+    - name: Bind 'vm-power-operator' for lifecycle management
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: user-vm-lifecycle-manager
+            namespace: "{{ shared_namespace }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: vm-power-operator
+          subjects:
+            - kind: User
+              name: "{{ shared_user }}"
+
+    - name: Create Fedora-based VMs with dedicated User login
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ shared_namespace }}"
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: "{{ item }}"
+          spec:
+            running: false
+            template:
+              spec:
+                domain:
+                  devices:
+                    disks:
+                      - name: containerdisk
+                        disk: {}
+                      - name: cloudinitdisk
+                        disk: {}
+                  resources:
+                    requests:
+                      memory: 2048Mi
+                volumes:
+                  - name: containerdisk
+                    containerDisk:
+                      image: quay.io/kubevirt/fedora-cloud-container-disk-demo:latest
+                  - name: cloudinitdisk
+                    cloudInitNoCloud:
+                      userData: |
+                        #cloud-config
+                        user: {{ shared_user }}
+                        password: password123
+                        chpasswd: { expire: False }
+                        sudo: ALL=(ALL) NOPASSWD:ALL
+                        runcmd:
+                          - echo "VM Name: {{ item }} - Date: {{ shared_date }}" > /etc/provision_info
+      loop: "{{ shared_vms }}"
