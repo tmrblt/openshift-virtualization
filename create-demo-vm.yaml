@@ -1,0 +1,56 @@
+---
+- name: Create Namespace and VM on OpenShift
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    target_namespace: "demo-namespace"
+    vm_name: "demo-vm"
+
+  tasks:
+    - name: Create a new Namespace
+      kubernetes.core.k8s:
+        name: "{{ target_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create a Virtual Machine (KubeVirt)
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ target_namespace }}"
+        definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: "{{ vm_name }}"
+          spec:
+            running: true
+            template:
+              spec:
+                domain:
+                  devices:
+                    disks:
+                      - name: containerdisk
+                        disk: {}
+                      - name: cloudinitdisk
+                        disk: {}
+                    interfaces:
+                      - name: default
+                        masquerade: {}
+                  resources:
+                    requests:
+                      memory: 1024Mi
+                networks:
+                  - name: default
+                    pod: {}
+                volumes:
+                  - name: containerdisk
+                    containerDisk:
+                      image: quay.io/kubevirt/cirros-container-disk-demo:latest
+                  - name: cloudinitdisk
+                    cloudInitNoCloud:
+                      userData: |
+                        #!/bin/bash
+                        echo "VM successfully provisioned using the new EE" > /tmp/welcome
