@@ -1,0 +1,14 @@
+---
+- name: "STEP 1: Process Survey Input"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: "Display the value received from the Survey"
+      debug:
+        msg: "The Survey input was: {{ namespace_name }}"
+
+    - name: "Pass the data to the next Workflow node"
+      set_stats:
+        data:
+          shared_namespace: "{{ namespace_name }}"
