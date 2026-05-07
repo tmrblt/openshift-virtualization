@@ -1,0 +1,10 @@
+---
+- name: "STEP 2: Display Transferred Data"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: "Print the variable passed via set_stats"
+      debug:
+        msg: "Data received from previous job: {{ namespace }}"
+      failed_when: namespace is not defined
