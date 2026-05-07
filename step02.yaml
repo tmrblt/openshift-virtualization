@@ -6,5 +6,5 @@
   tasks:
     - name: "Print the variable passed via set_stats"
       debug:
-        msg: "Data received from previous job: {{ namespace }}"
-      failed_when: namespace is not defined
+        msg: "Data received from previous job: {{ shared_namespace }}"
+      failed_when: shared_namespace is not defined
