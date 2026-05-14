@@ -39,6 +39,8 @@
               cpu: "10"
               memory: 40Gi
               requests.storage: "100Gi"
+              count/virtualmachines.kubevirt.io: "2" 
+              requests.storage: "50Gi"
 
     - name: Apply LimitRange
       kubernetes.core.k8s:
