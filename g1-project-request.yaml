@@ -11,6 +11,7 @@
   vars:
     # This variable is automatically injected by AAP/Controller
     actual_user: "{{ ansible_operator_user_name }}"
+    billing_group: "g1-provisioner"
     
   tasks:
     - name: Pre-check - Ensure user identity is captured
