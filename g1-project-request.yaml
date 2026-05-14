@@ -10,13 +10,10 @@
   
   vars:
     # This variable is automatically injected by AAP/Controller
-    actual_user: "{{ ansible_operator_user_name }}"
+    actual_user: "{{ awx_user_name }}"
     billing_group: "g1-provisioner"
     
   tasks:
-    - name: Show all accessible variables in AAP
-      debug:
-        var: hostvars[inventory_hostname]
     - name: Pre-check - Ensure user identity is captured
       fail:
         msg: "User identity could not be determined. This playbook must run within AAP."
