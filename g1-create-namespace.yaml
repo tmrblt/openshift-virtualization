@@ -1,0 +1,26 @@
+- name: Step 1 - Create Namespace
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    actual_user: "{{ awx_user_name }}"
+    billing_group: "g1-provisioner"
+  tasks:
+    - name: Pre-check - Ensure user identity is captured
+      fail:
+        msg: "User identity could not be determined."
+      when: actual_user is not defined or actual_user == ""
+
+    - name: Create Isolated Namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ project_name }}"
+            labels:
+              local-group: "{{ billing_group }}"
+              provisioned-via: "AAP-Portal"
+            annotations:
+              openshift.io/requester: "{{ actual_user }}"
