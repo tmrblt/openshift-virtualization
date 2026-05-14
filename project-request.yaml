@@ -1,0 +1,87 @@
+---
+- name: OpenShift Secure Project Provisioning
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  
+  # Logic: 
+  # 1. Mandatory use of AAP's authenticated username (ansible_operator_user_name).
+  # 2. No manual override for the owner - security by design.
+  
+  vars:
+    # This variable is automatically injected by AAP/Controller
+    actual_user: "{{ ansible_operator_user_name }}"
+    
+  tasks:
+    - name: Pre-check - Ensure user identity is captured
+      fail:
+        msg: "User identity could not be determined. This playbook must run within AAP."
+      when: actual_user is not defined or actual_user == ""
+
+    - name: Create Isolated Namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ project_name }}"
+            labels:
+              local-group: "{{ billing_group }}"
+              provisioned-via: "AAP-Portal"
+            annotations:
+              openshift.io/requester: "{{ actual_user }}"
+              ansible-job-id: "{{ tower_job_id | default('manual') }}"
+
+    - name: Create Immutable RoleBinding for the Authenticated User
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-admin-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: user-project-admin # Pre-defined ClusterRole (metadata-locked)
+          subjects:
+            - kind: User
+              name: "{{ actual_user }}"
+              apiGroup: rbac.authorization.k8s.io
+
+    - name: Apply ResourceQuota (Guardrails)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: default-quota
+            namespace: "{{ project_name }}"
+          spec:
+            hard:
+              cpu: "10"
+              memory: 40Gi
+              count/virtualmachines.kubevirt.io: "2"
+              requests.storage: "100Gi"
+
+    - name: Apply LimitRange (Auto-Scaling Prevention)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: default-limits
+            namespace: "{{ project_name }}"
+          spec:
+            limits:
+              - default:
+                  cpu: "2"
+                  memory: 4Gi
+                defaultRequest:
+                  cpu: "1"
+                  memory: 2Gi
+                type: Container
