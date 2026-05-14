@@ -1,0 +1,24 @@
+- name: Step 2 - Secure and Limit Namespace
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    actual_user: "{{ awx_user_name }}"
+  tasks:
+    - name: Create Immutable RoleBinding for the Authenticated User
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-admin-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: admin # Artık admin yetkisi verebiliriz çünkü bu job admin gücüyle çalışıyor
+          subjects:
+            - kind: User
+              name: "{{ actual_user }}"
+              apiGroup: rbac.authorization.k8s.io
