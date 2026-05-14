@@ -24,3 +24,37 @@
               provisioned-via: "AAP-Portal"
             annotations:
               openshift.io/requester: "{{ actual_user }}"
+
+    - name: Apply ResourceQuota (Guardrails)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: default-quota
+            namespace: "{{ project_name }}"
+          spec:
+            hard:
+              cpu: "10"
+              memory: 40Gi
+              requests.storage: "100Gi"
+
+    - name: Apply LimitRange
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: default-limits
+            namespace: "{{ project_name }}"
+          spec:
+            limits:
+              - default:
+                  cpu: "2"
+                  memory: 4Gi
+                defaultRequest:
+                  cpu: "1"
+                  memory: 2Gi
+                type: Container
