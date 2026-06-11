@@ -17,7 +17,7 @@
           roleRef:
             apiGroup: rbac.authorization.k8s.io
             kind: ClusterRole
-            name: admin # Artık admin yetkisi verebiliriz çünkü bu job admin gücüyle çalışıyor
+            name: admin 
           subjects:
             - kind: User
               name: "{{ actual_user }}"
