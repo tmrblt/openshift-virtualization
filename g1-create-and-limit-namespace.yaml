@@ -1,3 +1,4 @@
+#Credential: provisioner-user
 - name: Step 1 - Create Namespace
   hosts: localhost
   connection: local
