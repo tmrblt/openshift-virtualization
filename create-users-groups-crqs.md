@@ -223,8 +223,30 @@ rules:
 - apiGroups: [""]
   resources: ["namespaces"]
   verbs: ["get", "list", "watch"] # Denies UPDATE and PATCH to lock labels/annotations
+- apiGroups: ["quota.openshift.io"]
+  resources: ["clusterresourcequotas"]
+  verbs: ["get", "list", "watch"]
 ```
 ```
 oc create -f user-project-admin.yaml
 ```
+
+### 8. Create user-project-viewer ClusterRole
+```
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: user-project-viewer
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["quota.openshift.io"]
+  resources: ["clusterresourcequotas"]
+  verbs: ["get", "list", "watch"]
+```
+```
+oc create -f user-project-viewer.yaml
+```
+
 
