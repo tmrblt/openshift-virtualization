@@ -15,9 +15,9 @@ htpasswd -B -b htpasswd-users.htpasswd g2-provisioner redhat
 htpasswd -B -b htpasswd-users.htpasswd g2-user1 redhat
 htpasswd -B -b htpasswd-users.htpasswd g2-user2 redhat
 
-htpasswd -B -b htpasswd-users.htpasswd g2-provisioner redhat
-htpasswd -B -b htpasswd-users.htpasswd g2-user1 redhat
-htpasswd -B -b htpasswd-users.htpasswd g2-user2 redhat
+htpasswd -B -b htpasswd-users.htpasswd g3-provisioner redhat
+htpasswd -B -b htpasswd-users.htpasswd g3-user1 redhat
+htpasswd -B -b htpasswd-users.htpasswd g3-user2 redhat
 ```
 
 #3. Check contents of htpasswd file 
