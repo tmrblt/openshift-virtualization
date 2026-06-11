@@ -36,7 +36,7 @@ oc get oauth cluster -o yaml > oauth.yaml
 ```
 
 #6. Update oauth file for htpasswd
-```
+```yaml
 apiVersion: config.openshift.io/v1
 kind: OAuth
 ...output omitted...
