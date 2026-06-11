@@ -67,6 +67,7 @@ oc adm policy add-cluster-role-to-user cluster-admin admin
 
 #10. List users and identities
 ```
+#Login with a new user before running commands below
 oc get users
 oc get identity
 ```
