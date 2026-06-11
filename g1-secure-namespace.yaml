@@ -1,3 +1,4 @@
+#Credential: cluster-admin
 - name: Step 2 - Secure and Limit Namespace
   hosts: localhost
   connection: local
