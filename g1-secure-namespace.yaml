@@ -4,8 +4,10 @@
   gather_facts: false
   vars:
     actual_user: "{{ awx_user_name }}"
+    target_group: "group1" 
   tasks:
-    - name: Create Immutable RoleBinding for the Authenticated User
+    # 1. Grant Admin permissions to the user who requested and created the project
+    - name: Create Immutable RoleBinding for the Authenticated User (Admin)
       kubernetes.core.k8s:
         state: present
         definition:
@@ -17,8 +19,27 @@
           roleRef:
             apiGroup: rbac.authorization.k8s.io
             kind: ClusterRole
-            name: admin 
+            name: user-project-admin # Custom restricted admin role (locks labels/quotas)
           subjects:
             - kind: User
               name: "{{ actual_user }}"
+              apiGroup: rbac.authorization.k8s.io
+
+    # 2. Grant Read-Only (Viewer) permissions to the entire associated team/group
+    - name: Create RoleBinding for the Associated Group (Viewer)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-group-viewer-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: user-project-viewer # Custom secure read-only role
+          subjects:
+            - kind: Group
+              name: "{{ target_group }}" # Static group defined in vars (e.g., group1)
               apiGroup: rbac.authorization.k8s.io
