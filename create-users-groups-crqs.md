@@ -97,6 +97,7 @@ oc adm groups add-users group3 g3-user2
 ### 2. Cluster Resource Quotas
 
 ```
+cat << EOF >group1-crq.yaml
 # group1-crq.yaml
 apiVersion: quota.openshift.io/v1
 kind: ClusterResourceQuota
@@ -113,12 +114,14 @@ spec:
   selector:
     labels:
       matchLabels:
-        local-group: g1-provisioner
+        billing-group: group1
+EOF
 ```
 ```
 oc create -f group1-crq.yaml
 ``` 
 ```
+cat << EOF >group2-crq.yaml
 # group2-crq.yaml
 apiVersion: quota.openshift.io/v1
 kind: ClusterResourceQuota
@@ -135,12 +138,14 @@ spec:
   selector:
     labels:
       matchLabels:
-        local-group: g2-provisioner
+        billing-group: group2
+EOF
 ```
 ```
-oc create -f group2-crq.yaml
+oc create -f group3-crq.yaml
 ```         
 ```
+cat << EOF >group3-crq.yaml
 # group3-crq.yaml
 apiVersion: quota.openshift.io/v1
 kind: ClusterResourceQuota
@@ -157,7 +162,8 @@ spec:
   selector:
     labels:
       matchLabels:
-        local-group: g3-provisioner
+        billing-group: group3
+EOF
 ```
 ```
 oc create -f group3-crq.yaml
