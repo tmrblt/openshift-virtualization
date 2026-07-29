@@ -21,7 +21,7 @@
           metadata:
             name: "{{ project_name }}"
             labels:
-              local-group: "{{ billing_group }}"
+              billing-group: "{{ billing_group }}"
               provisioned-via: "AAP-Portal"
             annotations:
               openshift.io/requester: "{{ actual_user }}"
