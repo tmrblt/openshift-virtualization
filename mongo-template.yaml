@@ -1,0 +1,115 @@
+kind: Template
+apiVersion: template.openshift.io/v1
+metadata:
+  name: mongodb-83
+  namespace: template
+  uid: 86f488fd-9857-4954-9e28-297ae953fefa
+  resourceVersion: '407964'
+  creationTimestamp: '2026-07-29T11:31:51Z'
+  labels:
+    os.template.kubevirt.io/fedora: 'true'
+    template.kubevirt.io/type: vm
+    workload.template.kubevirt.io/server: 'true'
+  annotations:
+    description: MongoDB 8.3 virtual machine template based on Fedora Cloud
+    iconClass: icon-databases
+    name.os.template.kubevirt.io/fedora: Fedora
+    openshift.io/display-name: MongoDB 8.3
+  managedFields:
+    - manager: Mozilla
+      operation: Update
+      apiVersion: template.openshift.io/v1
+      time: '2026-07-29T11:31:51Z'
+      fieldsType: FieldsV1
+      fieldsV1:
+        'f:metadata':
+          'f:annotations':
+            .: {}
+            'f:description': {}
+            'f:iconClass': {}
+            'f:name.os.template.kubevirt.io/fedora': {}
+            'f:openshift.io/display-name': {}
+          'f:labels':
+            .: {}
+            'f:os.template.kubevirt.io/fedora': {}
+            'f:template.kubevirt.io/type': {}
+            'f:workload.template.kubevirt.io/server': {}
+        'f:objects': {}
+        'f:parameters': {}
+objects:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: '${NAME}'
+      annotations:
+        description: MongoDB 8.3 virtual machine based on Fedora Cloud
+      labels:
+        app: '${NAME}'
+        vm.kubevirt.io/template: mongodb-83
+        os.template.kubevirt.io/fedora: 'true'
+        workload.template.kubevirt.io/server: 'true'
+        database-type: mongodb83
+    spec:
+      runStrategy: Always
+      dataVolumeTemplates:
+        - metadata:
+            name: '${NAME}-rootdisk'
+          spec:
+            source:
+              http:
+                url: 'https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2'
+            storage:
+              storageClassName: ocs-storagecluster-ceph-rbd-virtualization
+              volumeMode: Block
+              accessModes:
+                - ReadWriteMany
+              resources:
+                requests:
+                  storage: 20Gi
+      template:
+        metadata:
+          annotations:
+            vm.kubevirt.io/flavor: medium
+            vm.kubevirt.io/os: fedora
+            vm.kubevirt.io/workload: server
+          labels:
+            app: '${NAME}'
+            kubevirt.io/domain: '${NAME}'
+            kubevirt.io/size: medium
+            os.template.kubevirt.io/fedora: 'true'
+            workload.template.kubevirt.io/server: 'true'
+            database-type: mongodb83
+        spec:
+          hostname: '${NAME}'
+          terminationGracePeriodSeconds: 180
+          domain:
+            cpu:
+              cores: 2
+              sockets: 1
+              threads: 1
+            memory:
+              guest: 3Gi
+            devices:
+              disks:
+                - name: rootdisk
+                  disk:
+                    bus: virtio
+              interfaces:
+                - name: default
+                  model: virtio
+                  masquerade: {}
+              networkInterfaceMultiqueue: true
+              rng: {}
+          networks:
+            - name: default
+              pod: {}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: '${NAME}-rootdisk'
+parameters:
+  - name: NAME
+    description: Automatically generated MongoDB 8.3 virtual machine name
+    generate: expression
+    from: 'mongodb-83-[a-z0-9]{5}'
+    required: true
