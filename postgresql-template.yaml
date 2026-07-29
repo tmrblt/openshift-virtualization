@@ -1,0 +1,111 @@
+kind: Template
+apiVersion: template.openshift.io/v1
+metadata:
+  name: postgresql-13
+  namespace: template
+  uid: d2ed7ae6-5582-4eba-960b-bc593d5644fd
+  resourceVersion: '403015'
+  creationTimestamp: '2026-07-29T11:03:18Z'
+  labels:
+    os.template.kubevirt.io/fedora: 'true'
+    template.kubevirt.io/type: vm
+    workload.template.kubevirt.io/server: 'true'
+  annotations:
+    description: PostgreSQL 13 virtual machine based on Fedora 40 Cloud image
+    iconClass: icon-databases
+    name.os.template.kubevirt.io/fedora: Fedora
+    openshift.io/display-name: PostgreSQL 13
+  managedFields:
+    - manager: Mozilla
+      operation: Update
+      apiVersion: template.openshift.io/v1
+      time: '2026-07-29T11:27:21Z'
+      fieldsType: FieldsV1
+      fieldsV1:
+        'f:metadata':
+          'f:annotations':
+            .: {}
+            'f:description': {}
+            'f:iconClass': {}
+            'f:name.os.template.kubevirt.io/fedora': {}
+            'f:openshift.io/display-name': {}
+          'f:labels':
+            .: {}
+            'f:os.template.kubevirt.io/fedora': {}
+            'f:template.kubevirt.io/type': {}
+            'f:workload.template.kubevirt.io/server': {}
+        'f:objects': {}
+        'f:parameters': {}
+objects:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: '${NAME}'
+      annotations:
+        description: PostgreSQL 13 virtual machine based on Fedora 40 Cloud
+      labels:
+        app: '${NAME}'
+        vm.kubevirt.io/template: postgresql-13
+        os.template.kubevirt.io/fedora: 'true'
+        workload.template.kubevirt.io/server: 'true'
+    spec:
+      runStrategy: Always
+      dataVolumeTemplates:
+        - metadata:
+            name: '${NAME}-rootdisk'
+          spec:
+            source:
+              http:
+                url: 'https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2'
+            storage:
+              storageClassName: ocs-storagecluster-ceph-rbd-virtualization
+              accessModes:
+                - ReadWriteMany
+              resources:
+                requests:
+                  storage: 20Gi
+      template:
+        metadata:
+          annotations:
+            vm.kubevirt.io/flavor: medium
+            vm.kubevirt.io/os: fedora
+            vm.kubevirt.io/workload: server
+          labels:
+            kubevirt.io/domain: '${NAME}'
+            kubevirt.io/size: medium
+            os.template.kubevirt.io/fedora: 'true'
+            workload.template.kubevirt.io/server: 'true'
+        spec:
+          hostname: '${NAME}'
+          terminationGracePeriodSeconds: 180
+          domain:
+            cpu:
+              cores: 2
+              sockets: 1
+              threads: 1
+            memory:
+              guest: 3Gi
+            devices:
+              disks:
+                - name: rootdisk
+                  disk:
+                    bus: virtio
+              interfaces:
+                - name: default
+                  model: virtio
+                  masquerade: {}
+              networkInterfaceMultiqueue: true
+              rng: {}
+          networks:
+            - name: default
+              pod: {}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: '${NAME}-rootdisk'
+parameters:
+  - name: NAME
+    description: Automatically generated PostgreSQL 13 virtual machine name
+    generate: expression
+    from: 'postgresql-13-[a-z0-9]{5}'
+    required: true
