@@ -1,8 +1,11 @@
 ---
-# Required survey variables:
+# Required workflow variables:
 #   project_name
 #   db_name
 #   vm_type
+#
+# actual_user should normally be published by a previous workflow node.
+# When it is unavailable, awx_user_name is used as a fallback.
 #
 # Allowed vm_type values:
 #   empty
@@ -16,7 +19,24 @@
 
   vars:
     template_namespace: "template"
-    selected_vm_type: "{{ vm_type | default('empty') | lower | trim }}"
+
+    selected_vm_type: >-
+      {{
+        vm_type
+        | default('empty')
+        | string
+        | lower
+        | trim
+      }}
+
+    workflow_actual_user: >-
+      {{
+        actual_user
+        | default(awx_user_name | default('', true), true)
+        | string
+        | trim
+      }}
+
     ssh_username: "fedora"
 
     database_templates:
@@ -51,7 +71,8 @@
         data:
           database_vm_created: false
           database_vm_type: "empty"
-          database_vm_project: "{{ project_name }}"
+          database_vm_project: "{{ project_name | default('') }}"
+          database_vm_owner: "{{ workflow_actual_user }}"
           database_vm_message: "No database virtual machine was requested."
         per_host: false
       when: selected_vm_type == 'empty'
@@ -60,26 +81,43 @@
       ansible.builtin.meta: end_play
       when: selected_vm_type == 'empty'
 
-    - name: Validate required inputs
+    - name: Validate required provisioning inputs
       ansible.builtin.assert:
         that:
           - project_name is defined
-          - project_name | trim | length > 0
+          - project_name | string | trim | length > 0
           - db_name is defined
-          - db_name | trim | length > 0
-        fail_msg: "project_name and db_name are required."
+          - db_name | string | trim | length > 0
+          - workflow_actual_user | length > 0
+        fail_msg: >-
+          project_name, db_name, and actual_user are required.
+          actual_user must be published by a previous workflow node or
+          awx_user_name must be available.
 
     - name: Normalize database name
       ansible.builtin.set_fact:
         normalized_db_name: >-
           {{
             db_name
+            | string
             | lower
             | trim
             | regex_replace('[^a-z0-9-]', '-')
             | regex_replace('-+', '-')
             | regex_replace('^-+', '')
             | regex_replace('-+$', '')
+          }}
+
+    - name: Normalize owner label value
+      ansible.builtin.set_fact:
+        owner_label: >-
+          {{
+            workflow_actual_user
+            | lower
+            | regex_replace('[^a-z0-9_.-]', '-')
+            | regex_replace('-+', '-')
+            | regex_replace('^[^a-z0-9]+', '')
+            | regex_replace('[^a-z0-9]+$', '')
           }}
 
     - name: Select database template
@@ -89,20 +127,23 @@
     - name: Build resource names
       ansible.builtin.set_fact:
         vm_name: "{{ selected_template.vm_prefix }}-{{ normalized_db_name }}"
-        cloud_init_secret_name: "{{ selected_template.vm_prefix }}-{{ normalized_db_name }}-cloud-init"
-        ssh_service_name: "{{ selected_template.vm_prefix }}-{{ normalized_db_name }}-ssh"
+        cloud_init_secret_name: >-
+          {{ selected_template.vm_prefix }}-{{ normalized_db_name }}-cloud-init
+        ssh_service_name: >-
+          {{ selected_template.vm_prefix }}-{{ normalized_db_name }}-ssh
 
-    - name: Validate generated resource names
+    - name: Validate generated values
       ansible.builtin.assert:
         that:
           - normalized_db_name | length > 0
+          - owner_label | length > 0
           - vm_name | length <= 63
           - cloud_init_secret_name | length <= 63
           - ssh_service_name | length <= 63
           - vm_name is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
         fail_msg: >-
-          The generated resource name is invalid or longer than 63 characters.
-          Use a shorter database name containing letters, numbers, or hyphens.
+          A generated resource name or owner label is invalid.
+          Use a shorter db_name containing letters, numbers, or hyphens.
 
     - name: Generate SSH password
       ansible.builtin.set_fact:
@@ -148,7 +189,26 @@
           - source_template.resources[0].objects | length > 0
         fail_msg: >-
           Template {{ template_namespace }}/{{ selected_template.template_name }}
-          was not found or does not contain a virtual machine definition.
+          was not found or does not contain a VirtualMachine object.
+
+    - name: Select VirtualMachine object from template
+      ansible.builtin.set_fact:
+        template_vm_object: >-
+          {{
+            source_template.resources[0].objects
+            | selectattr('kind', 'equalto', 'VirtualMachine')
+            | list
+            | first
+          }}
+
+    - name: Validate VirtualMachine template object
+      ansible.builtin.assert:
+        that:
+          - template_vm_object is defined
+          - template_vm_object.kind == 'VirtualMachine'
+        fail_msg: >-
+          Template {{ template_namespace }}/{{ selected_template.template_name }}
+          does not contain a valid VirtualMachine object.
 
     - name: Check for an existing virtual machine
       kubernetes.core.k8s_info:
@@ -180,8 +240,14 @@
               app.kubernetes.io/name: "{{ vm_name }}"
               app.kubernetes.io/component: "cloud-init"
               app.kubernetes.io/managed-by: "ansible-automation-platform"
+              app.kubernetes.io/created-by: "{{ owner_label }}"
               database-name: "{{ normalized_db_name }}"
               database-type: "{{ selected_template.database_label }}"
+              owner: "{{ owner_label }}"
+            annotations:
+              owner: "{{ workflow_actual_user }}"
+              openshift.io/requester: "{{ workflow_actual_user }}"
+              aap.redhat.com/launch-user: "{{ workflow_actual_user }}"
           type: Opaque
           stringData:
             userdata: |
@@ -225,7 +291,7 @@
       ansible.builtin.set_fact:
         base_vm_definition: >-
           {{
-            source_template.resources[0].objects[0]
+            template_vm_object
             | to_json
             | replace('${NAME}', vm_name)
             | from_json
@@ -246,20 +312,32 @@
             secretRef:
               name: "{{ cloud_init_secret_name }}"
 
-    - name: Read existing template disks
+    - name: Read existing template disks and volumes
       ansible.builtin.set_fact:
         existing_disks: >-
           {{
             base_vm_definition.spec.template.spec.domain.devices.disks
             | default([])
           }}
-
-    - name: Read existing template volumes
-      ansible.builtin.set_fact:
         existing_volumes: >-
           {{
             base_vm_definition.spec.template.spec.volumes
             | default([])
+          }}
+
+    - name: Remove existing cloud-init disk from template lists
+      ansible.builtin.set_fact:
+        filtered_disks: >-
+          {{
+            existing_disks
+            | rejectattr('name', 'equalto', 'cloudinitdisk')
+            | list
+          }}
+        filtered_volumes: >-
+          {{
+            existing_volumes
+            | rejectattr('name', 'equalto', 'cloudinitdisk')
+            | list
           }}
 
     - name: Build final virtual machine definition
@@ -281,8 +359,10 @@
                             'app.kubernetes.io/name': vm_name,
                             'app.kubernetes.io/component': 'database',
                             'app.kubernetes.io/managed-by': 'ansible-automation-platform',
+                            'app.kubernetes.io/created-by': owner_label,
                             'database-name': normalized_db_name,
-                            'database-type': selected_template.database_label
+                            'database-type': selected_template.database_label,
+                            'owner': owner_label
                           }
                         )
                     ),
@@ -293,7 +373,10 @@
                           {
                             'database-name': db_name,
                             'database-type': selected_template.database_label,
-                            'provisioned-via': 'AAP-Workflow'
+                            'provisioned-via': 'AAP-Workflow',
+                            'owner': workflow_actual_user,
+                            'openshift.io/requester': workflow_actual_user,
+                            'aap.redhat.com/launch-user': workflow_actual_user
                           }
                         )
                     )
@@ -319,7 +402,19 @@
                                                   'app': vm_name,
                                                   'kubevirt.io/domain': vm_name,
                                                   'database-name': normalized_db_name,
-                                                  'database-type': selected_template.database_label
+                                                  'database-type': selected_template.database_label,
+                                                  'owner': owner_label
+                                                }
+                                              )
+                                          ),
+                                          'annotations': (
+                                            base_vm_definition.spec.template.metadata.annotations
+                                            | default({})
+                                            | combine(
+                                                {
+                                                  'owner': workflow_actual_user,
+                                                  'openshift.io/requester': workflow_actual_user,
+                                                  'aap.redhat.com/launch-user': workflow_actual_user
                                                 }
                                               )
                                           )
@@ -339,7 +434,7 @@
                                                     base_vm_definition.spec.template.spec.domain.devices
                                                     | combine(
                                                         {
-                                                          'disks': existing_disks + [cloud_init_disk]
+                                                          'disks': filtered_disks + [cloud_init_disk]
                                                         },
                                                         recursive=True
                                                       )
@@ -348,7 +443,7 @@
                                                 recursive=True
                                               )
                                           ),
-                                          'volumes': existing_volumes + [cloud_init_volume]
+                                          'volumes': filtered_volumes + [cloud_init_volume]
                                         },
                                         recursive=True
                                       )
@@ -452,8 +547,14 @@
               app.kubernetes.io/name: "{{ vm_name }}"
               app.kubernetes.io/component: "ssh"
               app.kubernetes.io/managed-by: "ansible-automation-platform"
+              app.kubernetes.io/created-by: "{{ owner_label }}"
               database-name: "{{ normalized_db_name }}"
               database-type: "{{ selected_template.database_label }}"
+              owner: "{{ owner_label }}"
+            annotations:
+              owner: "{{ workflow_actual_user }}"
+              openshift.io/requester: "{{ workflow_actual_user }}"
+              aap.redhat.com/launch-user: "{{ workflow_actual_user }}"
           spec:
             type: NodePort
             selector:
@@ -482,22 +583,42 @@
         kind: Node
       register: cluster_nodes
 
-    - name: Select worker node IP
+    - name: Build worker and fallback node IP lists
       ansible.builtin.set_fact:
-        ssh_node_ip: >-
-          {%- set worker_ips = [] -%}
-          {%- set all_ips = [] -%}
+        worker_node_ips: >-
+          {%- set addresses = [] -%}
+          {%- for node in cluster_nodes.resources -%}
+          {%- if node.metadata.labels['node-role.kubernetes.io/worker'] is defined -%}
+          {%- for address in node.status.addresses | default([]) -%}
+          {%- if address.type == 'InternalIP' -%}
+          {%- set _ = addresses.append(address.address) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ addresses }}
+        all_node_ips: >-
+          {%- set addresses = [] -%}
           {%- for node in cluster_nodes.resources -%}
           {%- for address in node.status.addresses | default([]) -%}
           {%- if address.type == 'InternalIP' -%}
-          {%- set _ = all_ips.append(address.address) -%}
-          {%- if node.metadata.labels['node-role.kubernetes.io/worker'] is defined -%}
-          {%- set _ = worker_ips.append(address.address) -%}
-          {%- endif -%}
+          {%- set _ = addresses.append(address.address) -%}
           {%- endif -%}
           {%- endfor -%}
           {%- endfor -%}
-          {{ (worker_ips if worker_ips | length > 0 else all_ips) | first }}
+          {{ addresses }}
+
+    - name: Select SSH node IP
+      ansible.builtin.set_fact:
+        ssh_node_ip: >-
+          {{
+            (
+              worker_node_ips
+              if worker_node_ips | length > 0
+              else all_node_ips
+            )
+            | first
+          }}
 
     - name: Validate SSH endpoint
       ansible.builtin.assert:
@@ -517,6 +638,7 @@
           database_vm_project: "{{ project_name }}"
           database_vm_name: "{{ vm_name }}"
           database_vm_type: "{{ selected_vm_type }}"
+          database_vm_owner: "{{ workflow_actual_user }}"
           database_name: "{{ db_name }}"
           database_ssh_username: "{{ ssh_username }}"
           database_ssh_password: "{{ ssh_password }}"
@@ -534,6 +656,7 @@
           - "============================================================"
           - "Database virtual machine provisioning completed."
           - "Project       : {{ project_name }}"
+          - "Owner         : {{ workflow_actual_user }}"
           - "Database name : {{ db_name }}"
           - "Database type : {{ selected_vm_type }}"
           - "VM name       : {{ vm_name }}"
