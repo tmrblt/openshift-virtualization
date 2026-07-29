@@ -5,7 +5,7 @@
   gather_facts: false
   vars:
     actual_user: "{{ awx_user_name }}"
-    billing_group: "g1-provisioner"
+    billing_group: "group1"
   tasks:
     - name: Pre-check - Ensure user identity is captured
       fail:
