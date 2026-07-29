@@ -1,0 +1,578 @@
+---
+# Credential: provisioner-user
+#
+# Required workflow survey variables:
+#   project_name
+#   db_name
+#   vm_type
+#
+# Allowed vm_type values:
+#   empty
+#   postgresql13
+#   mongodb83
+
+- name: Step 3 - Provision Database Virtual Machine
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    template_namespace: "template"
+    selected_vm_type: "{{ vm_type | default('empty') | lower | trim }}"
+    ssh_username: "fedora"
+
+    database_templates:
+      postgresql13:
+        template_name: "postgresql-13"
+        vm_prefix: "postgresql-13"
+        database_label: "postgresql13"
+
+      mongodb83:
+        template_name: "mongodb-83"
+        vm_prefix: "mongodb-83"
+        database_label: "mongodb83"
+
+  tasks:
+    - name: Validate virtual machine selection
+      ansible.builtin.assert:
+        that:
+          - selected_vm_type in ['empty', 'postgresql13', 'mongodb83']
+        fail_msg: >-
+          Invalid vm_type value. Allowed values are empty, postgresql13,
+          and mongodb83.
+
+    - name: Return without creating a virtual machine
+      ansible.builtin.debug:
+        msg:
+          - "No virtual machine was selected."
+          - "Namespace preparation completed without database provisioning."
+      when: selected_vm_type == 'empty'
+
+    - name: Publish empty provisioning result
+      ansible.builtin.set_stats:
+        data:
+          database_vm_created: false
+          database_vm_type: "empty"
+          database_vm_project: "{{ project_name }}"
+          database_vm_message: "No database virtual machine was requested."
+        per_host: false
+      when: selected_vm_type == 'empty'
+
+    - name: End play when no virtual machine was selected
+      ansible.builtin.meta: end_play
+      when: selected_vm_type == 'empty'
+
+    - name: Validate required database provisioning inputs
+      ansible.builtin.assert:
+        that:
+          - project_name is defined
+          - project_name | trim | length > 0
+          - db_name is defined
+          - db_name | trim | length > 0
+        fail_msg: "project_name and db_name are required."
+
+    - name: Normalize database name
+      ansible.builtin.set_fact:
+        normalized_db_name: >-
+          {{
+            db_name
+            | lower
+            | trim
+            | regex_replace('[^a-z0-9-]', '-')
+            | regex_replace('-+', '-')
+            | regex_replace('^-+', '')
+            | regex_replace('-+$', '')
+          }}
+
+    - name: Select database template configuration
+      ansible.builtin.set_fact:
+        selected_template: "{{ database_templates[selected_vm_type] }}"
+
+    - name: Build resource names
+      ansible.builtin.set_fact:
+        vm_name: >-
+          {{
+            selected_template.vm_prefix
+          }}-{{ normalized_db_name }}
+        cloud_init_secret_name: >-
+          {{
+            selected_template.vm_prefix
+          }}-{{ normalized_db_name }}-cloud-init
+        ssh_service_name: >-
+          {{
+            selected_template.vm_prefix
+          }}-{{ normalized_db_name }}-ssh
+
+    - name: Validate generated resource names
+      ansible.builtin.assert:
+        that:
+          - normalized_db_name | length > 0
+          - vm_name | length <= 63
+          - cloud_init_secret_name | length <= 63
+          - ssh_service_name | length <= 63
+          - vm_name is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        fail_msg: >-
+          The generated resource name is invalid or longer than 63 characters.
+          Use a shorter database name containing lowercase letters, numbers,
+          or hyphens.
+
+    - name: Generate SSH password
+      ansible.builtin.set_fact:
+        ssh_password: >-
+          {{
+            lookup(
+              'ansible.builtin.password',
+              '/dev/null',
+              length=20,
+              chars=['ascii_letters', 'digits']
+            )
+          }}
+      no_log: true
+
+    - name: Verify target namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ project_name }}"
+      register: target_namespace
+
+    - name: Fail when target namespace does not exist
+      ansible.builtin.assert:
+        that:
+          - target_namespace.resources | length == 1
+        fail_msg: >-
+          Target namespace {{ project_name }} does not exist.
+          Run the namespace creation workflow steps first.
+
+    - name: Read selected virtual machine template
+      kubernetes.core.k8s_info:
+        api_version: template.openshift.io/v1
+        kind: Template
+        namespace: "{{ template_namespace }}"
+        name: "{{ selected_template.template_name }}"
+      register: source_template
+
+    - name: Validate selected virtual machine template
+      ansible.builtin.assert:
+        that:
+          - source_template.resources | length == 1
+          - source_template.resources[0].objects is defined
+          - source_template.resources[0].objects | length > 0
+        fail_msg: >-
+          Template {{ template_namespace }}/{{ selected_template.template_name }}
+          was not found or does not contain a virtual machine definition.
+
+    - name: Check for an existing virtual machine
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ project_name }}"
+        name: "{{ vm_name }}"
+      register: existing_vm
+
+    - name: Prevent replacement of an existing virtual machine
+      ansible.builtin.assert:
+        that:
+          - existing_vm.resources | length == 0
+        fail_msg: >-
+          VirtualMachine {{ project_name }}/{{ vm_name }} already exists.
+          Select a different db_name or remove the existing virtual machine.
+
+    - name: Create cloud-init configuration secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ cloud_init_secret_name }}"
+            namespace: "{{ project_name }}"
+            labels:
+              app: "{{ vm_name }}"
+              app.kubernetes.io/name: "{{ vm_name }}"
+              app.kubernetes.io/component: "cloud-init"
+              app.kubernetes.io/managed-by: "ansible-automation-platform"
+              database-name: "{{ normalized_db_name }}"
+              database-type: "{{ selected_template.database_label }}"
+          type: Opaque
+          stringData:
+            userData: |
+              #cloud-config
+              hostname: {{ vm_name }}
+              manage_etc_hosts: true
+              ssh_pwauth: true
+              disable_root: true
+
+              users:
+                - default
+                - name: {{ ssh_username }}
+                  gecos: Database Administrator
+                  groups:
+                    - wheel
+                  sudo: ALL=(ALL) NOPASSWD:ALL
+                  shell: /bin/bash
+                  lock_passwd: false
+
+              chpasswd:
+                expire: false
+                users:
+                  - name: {{ ssh_username }}
+                    password: {{ ssh_password }}
+                    type: text
+
+              growpart:
+                mode: auto
+                devices:
+                  - /
+                ignore_growroot_disabled: false
+
+              resize_rootfs: true
+
+              runcmd:
+                - systemctl enable sshd
+                - systemctl restart sshd
+      no_log: true
+
+    - name: Convert template object into virtual machine definition
+      ansible.builtin.set_fact:
+        base_vm_definition: >-
+          {{
+            source_template.resources[0].objects[0]
+            | to_json
+            | replace('${NAME}', vm_name)
+            | from_json
+          }}
+
+    - name: Define cloud-init disk
+      ansible.builtin.set_fact:
+        cloud_init_disk:
+          name: cloudinitdisk
+          disk:
+            bus: virtio
+
+    - name: Define cloud-init volume
+      ansible.builtin.set_fact:
+        cloud_init_volume:
+          name: cloudinitdisk
+          cloudInitNoCloud:
+            userDataSecretRef:
+              name: "{{ cloud_init_secret_name }}"
+
+    - name: Read template disks and volumes
+      ansible.builtin.set_fact:
+        existing_disks: >-
+          {{
+            base_vm_definition.spec.template.spec.domain.devices.disks
+            | default([])
+          }}
+        existing_volumes: >-
+          {{
+            base_vm_definition.spec.template.spec.volumes
+            | default([])
+          }}
+
+    - name: Build final virtual machine definition
+      ansible.builtin.set_fact:
+        final_vm_definition: >-
+          {{
+            base_vm_definition
+            | combine(
+                {
+                  'metadata': {
+                    'name': vm_name,
+                    'namespace': project_name,
+                    'labels': (
+                      base_vm_definition.metadata.labels
+                      | default({})
+                      | combine(
+                          {
+                            'app': vm_name,
+                            'app.kubernetes.io/name': vm_name,
+                            'app.kubernetes.io/component': 'database',
+                            'app.kubernetes.io/managed-by': 'ansible-automation-platform',
+                            'database-name': normalized_db_name,
+                            'database-type': selected_template.database_label
+                          }
+                        )
+                    ),
+                    'annotations': (
+                      base_vm_definition.metadata.annotations
+                      | default({})
+                      | combine(
+                          {
+                            'database-name': db_name,
+                            'database-type': selected_template.database_label,
+                            'provisioned-via': 'AAP-Workflow'
+                          }
+                        )
+                    )
+                  },
+                  'spec': (
+                    base_vm_definition.spec
+                    | combine(
+                        {
+                          'template': (
+                            base_vm_definition.spec.template
+                            | combine(
+                                {
+                                  'metadata': (
+                                    base_vm_definition.spec.template.metadata
+                                    | default({})
+                                    | combine(
+                                        {
+                                          'labels': (
+                                            base_vm_definition.spec.template.metadata.labels
+                                            | default({})
+                                            | combine(
+                                                {
+                                                  'app': vm_name,
+                                                  'kubevirt.io/domain': vm_name,
+                                                  'database-name': normalized_db_name,
+                                                  'database-type': selected_template.database_label
+                                                }
+                                              )
+                                          )
+                                        },
+                                        recursive=True
+                                      )
+                                  ),
+                                  'spec': (
+                                    base_vm_definition.spec.template.spec
+                                    | combine(
+                                        {
+                                          'domain': (
+                                            base_vm_definition.spec.template.spec.domain
+                                            | combine(
+                                                {
+                                                  'devices': (
+                                                    base_vm_definition.spec.template.spec.domain.devices
+                                                    | combine(
+                                                        {
+                                                          'disks': existing_disks + [cloud_init_disk]
+                                                        },
+                                                        recursive=True
+                                                      )
+                                                  )
+                                                },
+                                                recursive=True
+                                              )
+                                          ),
+                                          'volumes': existing_volumes + [cloud_init_volume]
+                                        },
+                                        recursive=True
+                                      )
+                                  )
+                                },
+                                recursive=True
+                              )
+                          )
+                        },
+                        recursive=True
+                      )
+                  )
+                },
+                recursive=True
+              )
+          }}
+
+    - name: Create database virtual machine
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ final_vm_definition }}"
+
+    - name: Determine root disk DataVolume name
+      ansible.builtin.set_fact:
+        root_datavolume_name: >-
+          {{
+            final_vm_definition.spec.dataVolumeTemplates[0].metadata.name
+          }}
+
+    - name: Wait for DataVolume creation
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        namespace: "{{ project_name }}"
+        name: "{{ root_datavolume_name }}"
+      register: datavolume_creation
+      retries: 60
+      delay: 5
+      until:
+        - datavolume_creation.resources | length == 1
+
+    - name: Wait for disk import to complete
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        namespace: "{{ project_name }}"
+        name: "{{ root_datavolume_name }}"
+      register: datavolume_status
+      retries: 180
+      delay: 10
+      until:
+        - datavolume_status.resources | length == 1
+        - datavolume_status.resources[0].status is defined
+        - datavolume_status.resources[0].status.phase | default('') == 'Succeeded'
+
+    - name: Wait for virtual machine instance creation
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        namespace: "{{ project_name }}"
+        name: "{{ vm_name }}"
+      register: vmi_creation
+      retries: 90
+      delay: 10
+      until:
+        - vmi_creation.resources | length == 1
+
+    - name: Wait for virtual machine instance readiness
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        namespace: "{{ project_name }}"
+        name: "{{ vm_name }}"
+      register: vmi_status
+      retries: 120
+      delay: 10
+      until:
+        - vmi_status.resources | length == 1
+        - vmi_status.resources[0].status is defined
+        - vmi_status.resources[0].status.conditions is defined
+        - >-
+          (
+            vmi_status.resources[0].status.conditions
+            | selectattr('type', 'equalto', 'Ready')
+            | selectattr('status', 'equalto', 'True')
+            | list
+            | length
+          ) > 0
+
+    - name: Create SSH NodePort service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ ssh_service_name }}"
+            namespace: "{{ project_name }}"
+            labels:
+              app: "{{ vm_name }}"
+              app.kubernetes.io/name: "{{ vm_name }}"
+              app.kubernetes.io/component: "ssh"
+              app.kubernetes.io/managed-by: "ansible-automation-platform"
+              database-name: "{{ normalized_db_name }}"
+              database-type: "{{ selected_template.database_label }}"
+          spec:
+            type: NodePort
+            selector:
+              kubevirt.io/domain: "{{ vm_name }}"
+            ports:
+              - name: ssh
+                protocol: TCP
+                port: 22
+                targetPort: 22
+
+    - name: Read SSH NodePort service
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        namespace: "{{ project_name }}"
+        name: "{{ ssh_service_name }}"
+      register: ssh_service
+
+    - name: Store assigned SSH NodePort
+      ansible.builtin.set_fact:
+        ssh_node_port: "{{ ssh_service.resources[0].spec.ports[0].nodePort }}"
+
+    - name: Read cluster nodes
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: cluster_nodes
+
+    - name: Build worker node IP list
+      ansible.builtin.set_fact:
+        worker_node_ips: >-
+          {%- set addresses = [] -%}
+          {%- for node in cluster_nodes.resources -%}
+          {%- if node.metadata.labels['node-role.kubernetes.io/worker'] is defined -%}
+          {%- for address in node.status.addresses | default([]) -%}
+          {%- if address.type == 'InternalIP' -%}
+          {%- set _ = addresses.append(address.address) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ addresses }}
+
+    - name: Build fallback node IP list
+      ansible.builtin.set_fact:
+        all_node_ips: >-
+          {%- set addresses = [] -%}
+          {%- for node in cluster_nodes.resources -%}
+          {%- for address in node.status.addresses | default([]) -%}
+          {%- if address.type == 'InternalIP' -%}
+          {%- set _ = addresses.append(address.address) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ addresses }}
+
+    - name: Select SSH node IP
+      ansible.builtin.set_fact:
+        ssh_node_ip: >-
+          {{
+            (
+              worker_node_ips
+              if worker_node_ips | length > 0
+              else all_node_ips
+            )
+            | first
+          }}
+
+    - name: Validate SSH access endpoint
+      ansible.builtin.assert:
+        that:
+          - ssh_node_ip is defined
+          - ssh_node_ip | string | length > 0
+          - ssh_node_port is defined
+          - ssh_node_port | string | length > 0
+        fail_msg: >-
+          The virtual machine was created, but the NodePort endpoint
+          could not be determined.
+
+    - name: Publish database virtual machine information
+      ansible.builtin.set_stats:
+        data:
+          database_vm_created: true
+          database_vm_project: "{{ project_name }}"
+          database_vm_name: "{{ vm_name }}"
+          database_vm_type: "{{ selected_vm_type }}"
+          database_name: "{{ db_name }}"
+          database_ssh_username: "{{ ssh_username }}"
+          database_ssh_password: "{{ ssh_password }}"
+          database_ssh_host: "{{ ssh_node_ip }}"
+          database_ssh_port: "{{ ssh_node_port }}"
+          database_ssh_endpoint: "{{ ssh_node_ip }}:{{ ssh_node_port }}"
+          database_ssh_command: >-
+            ssh -p {{ ssh_node_port }} {{ ssh_username }}@{{ ssh_node_ip }}
+        per_host: false
+      no_log: true
+
+    - name: Display database virtual machine access information
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "Database virtual machine provisioning completed."
+          - "Project       : {{ project_name }}"
+          - "Database name : {{ db_name }}"
+          - "Database type : {{ selected_vm_type }}"
+          - "VM name       : {{ vm_name }}"
+          - "SSH username  : {{ ssh_username }}"
+          - "SSH password  : {{ ssh_password }}"
+          - "SSH host      : {{ ssh_node_ip }}"
+          - "SSH port      : {{ ssh_node_port }}"
+          - "SSH endpoint  : {{ ssh_node_ip }}:{{ ssh_node_port }}"
+          - "SSH command   : ssh -p {{ ssh_node_port }} {{ ssh_username }}@{{ ssh_node_ip }}"
+          - "============================================================"
