@@ -1,0 +1,350 @@
+# Credential: provisioner-user
+- name: Step 2 - Provision Database VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    template_namespace: "template"
+    ssh_user: "fedora"
+
+  tasks:
+    - name: Validate project_name
+      ansible.builtin.fail:
+        msg: "project_name is required."
+      when:
+        - project_name is not defined or project_name | trim == ""
+
+    - name: Validate actual_user
+      ansible.builtin.fail:
+        msg: "actual_user is required."
+      when:
+        - actual_user is not defined or actual_user | trim == ""
+
+    - name: Validate dbtype
+      ansible.builtin.fail:
+        msg: "Invalid dbtype '{{ dbtype | default('undefined') }}'. Allowed values: postgresql13, mongodb83"
+      when:
+        - dbtype is not defined or dbtype not in ['postgresql13', 'mongodb83']
+
+    - name: Select database template
+      ansible.builtin.set_fact:
+        selected_template: "{{ 'postgresql-13' if dbtype == 'postgresql13' else 'mongodb-83' }}"
+
+    - name: Verify target namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ project_name }}"
+      register: namespace_check
+
+    - name: Fail if target namespace does not exist
+      ansible.builtin.fail:
+        msg: "Namespace '{{ project_name }}' does not exist."
+      when:
+        - namespace_check.resources | length == 0
+
+    - name: Verify impersonated user can access target project
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        namespace: "{{ project_name }}"
+        impersonate_user: "{{ actual_user }}"
+      register: impersonation_check
+
+    - name: Generate SSH password
+      ansible.builtin.set_fact:
+        ssh_password: >-
+          {{
+            lookup(
+              'ansible.builtin.password',
+              '/dev/null',
+              length=20,
+              chars=['ascii_letters', 'digits']
+            )
+          }}
+      no_log: true
+
+    - name: Process selected OpenShift VM template
+      ansible.builtin.command:
+        argv:
+          - oc
+          - process
+          - -n
+          - "{{ template_namespace }}"
+          - "{{ selected_template }}"
+          - -o
+          - json
+      register: processed_template
+      changed_when: false
+
+    - name: Extract generated VM
+      ansible.builtin.set_fact:
+        generated_vm: "{{ (processed_template.stdout | from_json).items[0] }}"
+
+    - name: Capture generated VM name
+      ansible.builtin.set_fact:
+        vm_name: "{{ generated_vm.metadata.name }}"
+
+    - name: Build cloud-init user data
+      ansible.builtin.set_fact:
+        cloud_init_userdata: |
+          #cloud-config
+          ssh_pwauth: true
+          chpasswd:
+            expire: false
+            users:
+              - name: {{ ssh_user }}
+                password: "{{ ssh_password }}"
+                type: text
+          runcmd:
+            - systemctl enable --now sshd
+            - systemctl restart sshd
+      no_log: true
+
+    - name: Create cloud-init Secret as requesting user
+      kubernetes.core.k8s:
+        state: present
+        impersonate_user: "{{ actual_user }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ vm_name }}-cloudinit"
+            namespace: "{{ project_name }}"
+            labels:
+              app: "{{ vm_name }}"
+              database-type: "{{ dbtype }}"
+              provisioned-via: "AAP-Portal"
+            annotations:
+              openshift.io/requester: "{{ actual_user }}"
+          type: Opaque
+          stringData:
+            userdata: "{{ cloud_init_userdata }}"
+      no_log: true
+
+    - name: Build final VM definition
+      ansible.builtin.set_fact:
+        final_vm: >-
+          {{
+            generated_vm
+            | combine(
+                {
+                  'metadata':
+                    generated_vm.metadata
+                    | combine(
+                        {
+                          'namespace': project_name,
+                          'annotations':
+                            (
+                              generated_vm.metadata.annotations
+                              | default({})
+                            )
+                            | combine(
+                                {
+                                  'openshift.io/requester': actual_user,
+                                  'aap.openshift.io/requested-by': actual_user
+                                }
+                              ),
+                          'labels':
+                            (
+                              generated_vm.metadata.labels
+                              | default({})
+                            )
+                            | combine(
+                                {
+                                  'vm.kubevirt.io/template.namespace': template_namespace
+                                }
+                              )
+                        },
+                        recursive=True
+                      ),
+                  'spec':
+                    generated_vm.spec
+                    | combine(
+                        {
+                          'template':
+                            generated_vm.spec.template
+                            | combine(
+                                {
+                                  'spec':
+                                    generated_vm.spec.template.spec
+                                    | combine(
+                                        {
+                                          'domain':
+                                            generated_vm.spec.template.spec.domain
+                                            | combine(
+                                                {
+                                                  'devices':
+                                                    generated_vm.spec.template.spec.domain.devices
+                                                    | combine(
+                                                        {
+                                                          'disks':
+                                                            generated_vm.spec.template.spec.domain.devices.disks
+                                                            +
+                                                            [
+                                                              {
+                                                                'name': 'cloudinitdisk',
+                                                                'disk': {
+                                                                  'bus': 'virtio'
+                                                                }
+                                                              }
+                                                            ]
+                                                        },
+                                                        recursive=True
+                                                      )
+                                                },
+                                                recursive=True
+                                              ),
+                                          'volumes':
+                                            generated_vm.spec.template.spec.volumes
+                                            +
+                                            [
+                                              {
+                                                'name': 'cloudinitdisk',
+                                                'cloudInitNoCloud': {
+                                                  'userDataSecretRef': {
+                                                    'name': vm_name ~ '-cloudinit'
+                                                  }
+                                                }
+                                              }
+                                            ]
+                                        },
+                                        recursive=True
+                                      )
+                                },
+                                recursive=True
+                              )
+                        },
+                        recursive=True
+                      )
+                },
+                recursive=True
+              )
+          }}
+      no_log: true
+
+    - name: Create database VM as requesting user
+      kubernetes.core.k8s:
+        state: present
+        impersonate_user: "{{ actual_user }}"
+        definition: "{{ final_vm }}"
+      no_log: true
+
+    - name: Wait until VM is ready
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ project_name }}"
+        name: "{{ vm_name }}"
+      register: vm_status
+      until:
+        - vm_status.resources | length > 0
+        - vm_status.resources[0].status is defined
+        - vm_status.resources[0].status.ready | default(false) | bool
+      retries: 60
+      delay: 10
+
+    - name: Wait until VMI is running
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        namespace: "{{ project_name }}"
+        name: "{{ vm_name }}"
+      register: vmi_status
+      until:
+        - vmi_status.resources | length > 0
+        - vmi_status.resources[0].status.phase | default('') == 'Running'
+        - vmi_status.resources[0].status.nodeName | default('') | length > 0
+      retries: 60
+      delay: 5
+
+    - name: Capture VMI information
+      ansible.builtin.set_fact:
+        vm_node_name: "{{ vmi_status.resources[0].status.nodeName }}"
+        vm_internal_ip: >-
+          {{
+            vmi_status.resources[0].status.interfaces[0].ipAddress
+            | default('N/A')
+          }}
+
+    - name: Create SSH NodePort Service as requesting user
+      kubernetes.core.k8s:
+        state: present
+        impersonate_user: "{{ actual_user }}"
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}-ssh"
+            namespace: "{{ project_name }}"
+            labels:
+              app: "{{ vm_name }}"
+              database-type: "{{ dbtype }}"
+              provisioned-via: "AAP-Portal"
+            annotations:
+              openshift.io/requester: "{{ actual_user }}"
+          spec:
+            type: NodePort
+            selector:
+              kubevirt.io/domain: "{{ vm_name }}"
+            ports:
+              - name: ssh
+                protocol: TCP
+                port: 22
+                targetPort: 22
+      register: ssh_service_create
+
+    - name: Read SSH Service
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        namespace: "{{ project_name }}"
+        name: "{{ vm_name }}-ssh"
+      register: ssh_service
+
+    - name: Capture Service information
+      ansible.builtin.set_fact:
+        ssh_cluster_ip: "{{ ssh_service.resources[0].spec.clusterIP }}"
+        ssh_node_port: "{{ ssh_service.resources[0].spec.ports[0].nodePort }}"
+
+    - name: Read VM node
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        name: "{{ vm_node_name }}"
+      register: vm_node
+
+    - name: Capture node InternalIP
+      ansible.builtin.set_fact:
+        ssh_node_ip: >-
+          {{
+            (
+              vm_node.resources[0].status.addresses
+              | selectattr('type', 'equalto', 'InternalIP')
+              | map(attribute='address')
+              | list
+            )[0]
+          }}
+
+    - name: Display database VM access information
+      ansible.builtin.debug:
+        msg:
+          - "======================================================"
+          - " DATABASE VM PROVISIONING COMPLETED"
+          - "======================================================"
+          - "Requested By   : {{ actual_user }}"
+          - "Project        : {{ project_name }}"
+          - "Database Type  : {{ dbtype }}"
+          - "Template       : {{ selected_template }}"
+          - "VM Name        : {{ vm_name }}"
+          - "VM Internal IP : {{ vm_internal_ip }}"
+          - "ClusterIP      : {{ ssh_cluster_ip }}"
+          - "Node           : {{ vm_node_name }}"
+          - "Node IP        : {{ ssh_node_ip }}"
+          - "NodePort       : {{ ssh_node_port }}"
+          - "SSH User       : {{ ssh_user }}"
+          - "SSH Password   : {{ ssh_password }}"
+          - "SSH Address    : {{ ssh_node_ip }}:{{ ssh_node_port }}"
+          - "SSH Command    : ssh {{ ssh_user }}@{{ ssh_node_ip }} -p {{ ssh_node_port }}"
+          - "======================================================"
