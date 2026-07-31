@@ -1,0 +1,100 @@
+- name: Provision namespace
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    actual_user: "{{ awx_user_name }}"
+    billing_group: "group1"
+
+  tasks:
+    - name: Pre-check - Ensure user identity is captured
+      ansible.builtin.fail:
+        msg: "User identity could not be determined."
+      when:
+        - actual_user is not defined or actual_user | trim == ""
+
+    - name: Create Isolated Namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ project_name }}"
+            labels:
+              billing-group: "{{ billing_group }}"
+              provisioned-via: AAP-Portal
+            annotations:
+              openshift.io/requester: "{{ actual_user }}"
+
+    - name: Apply ResourceQuota
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: default-quota
+            namespace: "{{ project_name }}"
+          spec:
+            hard:
+              cpu: "10"
+              memory: 40Gi
+              requests.storage: 100Gi
+              count/virtualmachines.kubevirt.io: "2"
+
+    - name: Apply LimitRange
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: default-limits
+            namespace: "{{ project_name }}"
+          spec:
+            limits:
+              - type: Container
+                default:
+                  cpu: "2"
+                  memory: 4Gi
+                defaultRequest:
+                  cpu: "1"
+                  memory: 2Gi
+
+    - name: Grant project admin permissions to requester
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-admin-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: user-project-admin
+          subjects:
+            - kind: User
+              name: "{{ actual_user }}"
+              apiGroup: rbac.authorization.k8s.io
+
+    - name: Grant project viewer permissions to billing group
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-group-viewer-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: user-project-viewer
+          subjects:
+            - kind: Group
+              name: "{{ billing_group }}"
+              apiGroup: rbac.authorization.k8s.io
