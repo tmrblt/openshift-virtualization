@@ -1,4 +1,5 @@
-- name: Step 1 - Provision Namespace and Database VM
+# Credential: provisioner-user
+- name: Provision Namespace and Database VM
   hosts: localhost
   connection: local
   gather_facts: false
@@ -10,34 +11,37 @@
     ssh_user: "fedora"
 
   tasks:
+
     # ============================================================
     # VALIDATION
     # ============================================================
 
-    - name: Pre-check - Ensure user identity is captured
+    - name: Validate actual user
       ansible.builtin.fail:
         msg: "User identity could not be determined."
       when:
         - actual_user is not defined or actual_user | trim == ""
 
-    - name: Validate project_name
+    - name: Validate project name
       ansible.builtin.fail:
         msg: "project_name is required."
       when:
         - project_name is not defined or project_name | trim == ""
 
-    - name: Validate dbtype
+    - name: Validate database type
       ansible.builtin.fail:
-        msg: "Invalid dbtype '{{ dbtype | default('undefined') }}'. Allowed values: postgresql13, mongodb83"
+        msg: >-
+          Invalid dbtype '{{ dbtype | default("undefined") }}'.
+          Allowed values: postgresql13, mongodb83
       when:
-        - dbtype is not defined
-          or dbtype not in ['postgresql13', 'mongodb83']
+        - dbtype is not defined or dbtype not in ['postgresql13', 'mongodb83']
+
 
     # ============================================================
     # NAMESPACE
     # ============================================================
 
-    - name: Create Isolated Namespace
+    - name: Create isolated namespace
       kubernetes.core.k8s:
         state: present
         definition:
@@ -50,6 +54,11 @@
               provisioned-via: AAP-Portal
             annotations:
               openshift.io/requester: "{{ actual_user }}"
+
+
+    # ============================================================
+    # RESOURCE GUARDRAILS
+    # ============================================================
 
     - name: Apply ResourceQuota
       kubernetes.core.k8s:
@@ -85,6 +94,7 @@
                 defaultRequest:
                   cpu: "1"
                   memory: 2Gi
+
 
     # ============================================================
     # PROJECT RBAC
@@ -126,8 +136,9 @@
               name: "{{ billing_group }}"
               apiGroup: rbac.authorization.k8s.io
 
+
     # ============================================================
-    # DATABASE TEMPLATE SELECTION
+    # SELECT DATABASE TEMPLATE
     # ============================================================
 
     - name: Select database template
@@ -139,8 +150,70 @@
             else 'mongodb-83'
           }}
 
+
     # ============================================================
-    # SSH CREDENTIAL
+    # READ OPENSHIFT TEMPLATE
+    # ============================================================
+
+    - name: Read selected OpenShift template
+      kubernetes.core.k8s_info:
+        api_version: template.openshift.io/v1
+        kind: Template
+        namespace: "{{ template_namespace }}"
+        name: "{{ selected_template }}"
+      register: template_info
+
+    - name: Fail if template does not exist
+      ansible.builtin.fail:
+        msg: >-
+          Template '{{ selected_template }}' was not found
+          in namespace '{{ template_namespace }}'.
+      when:
+        - template_info.resources | length == 0
+
+
+    # ============================================================
+    # GENERATE VM NAME
+    # ============================================================
+
+    - name: Generate VM name suffix
+      ansible.builtin.set_fact:
+        vm_suffix: >-
+          {{
+            lookup(
+              'ansible.builtin.password',
+              '/dev/null',
+              length=5,
+              chars=['ascii_lowercase', 'digits']
+            )
+          }}
+
+    - name: Build VM name
+      ansible.builtin.set_fact:
+        vm_name: "{{ selected_template }}-{{ vm_suffix }}"
+
+
+    # ============================================================
+    # EXTRACT VM FROM TEMPLATE
+    # ============================================================
+
+    - name: Extract VirtualMachine definition from template
+      ansible.builtin.set_fact:
+        generated_vm: "{{ template_info.resources[0].objects[0] }}"
+
+    - name: Replace template NAME parameter
+      ansible.builtin.set_fact:
+        generated_vm: >-
+          {{
+            generated_vm
+            | to_json
+            | replace('${NAME}', vm_name)
+            | from_json
+          }}
+
+
+    # ============================================================
+    # GENERATE SSH PASSWORD
     # ============================================================
 
     - name: Generate SSH password
@@ -156,36 +229,12 @@
           }}
       no_log: true
 
-    # ============================================================
-    # PROCESS OPENSHIFT TEMPLATE
-    # ============================================================
-
-    - name: Process selected database template
-      ansible.builtin.command:
-        argv:
-          - oc
-          - process
-          - -n
-          - "{{ template_namespace }}"
-          - "{{ selected_template }}"
-          - -o
-          - json
-      register: processed_template
-      changed_when: false
-
-    - name: Extract generated VM
-      ansible.builtin.set_fact:
-        generated_vm: "{{ (processed_template.stdout | from_json).items[0] }}"
-
-    - name: Capture generated VM name
-      ansible.builtin.set_fact:
-        vm_name: "{{ generated_vm.metadata.name }}"
 
     # ============================================================
     # CLOUD-INIT
     # ============================================================
 
-    - name: Build cloud-init user data
+    - name: Build cloud-init configuration
       ansible.builtin.set_fact:
         cloud_init_userdata: |
           #cloud-config
@@ -201,7 +250,7 @@
             - systemctl restart sshd
       no_log: true
 
-    - name: Create cloud-init Secret as requesting user
+    - name: Create cloud-init Secret
       kubernetes.core.k8s:
         state: present
         impersonate_user: "{{ actual_user }}"
@@ -222,8 +271,9 @@
             userdata: "{{ cloud_init_userdata }}"
       no_log: true
 
+
     # ============================================================
-    # BUILD FINAL VM
+    # BUILD FINAL VM DEFINITION
     # ============================================================
 
     - name: Build final VM definition
@@ -238,6 +288,7 @@
                     | combine(
                         {
                           'namespace': project_name,
+
                           'annotations':
                             (
                               generated_vm.metadata.annotations
@@ -249,6 +300,7 @@
                                   'aap.openshift.io/requested-by': actual_user
                                 }
                               ),
+
                           'labels':
                             (
                               generated_vm.metadata.labels
@@ -331,8 +383,9 @@
           }}
       no_log: true
 
+
     # ============================================================
-    # CREATE VM
+    # CREATE VM AS ACTUAL USER
     # ============================================================
 
     - name: Create database VM as requesting user
@@ -341,6 +394,7 @@
         impersonate_user: "{{ actual_user }}"
         definition: "{{ final_vm }}"
       no_log: true
+
 
     # ============================================================
     # WAIT FOR VM
@@ -383,11 +437,12 @@
             | default('N/A')
           }}
 
+
     # ============================================================
     # SSH NODEPORT SERVICE
     # ============================================================
 
-    - name: Create SSH NodePort Service as requesting user
+    - name: Create SSH NodePort Service
       kubernetes.core.k8s:
         state: present
         impersonate_user: "{{ actual_user }}"
@@ -412,7 +467,11 @@
                 protocol: TCP
                 port: 22
                 targetPort: 22
-      register: ssh_service_create
+
+
+    # ============================================================
+    # READ SERVICE INFORMATION
+    # ============================================================
 
     - name: Read SSH Service
       kubernetes.core.k8s_info:
@@ -427,8 +486,9 @@
         ssh_cluster_ip: "{{ ssh_service.resources[0].spec.clusterIP }}"
         ssh_node_port: "{{ ssh_service.resources[0].spec.ports[0].nodePort }}"
 
+
     # ============================================================
-    # NODE ADDRESS
+    # GET VM NODE ADDRESS
     # ============================================================
 
     - name: Read VM node
@@ -449,6 +509,7 @@
               | list
             )[0]
           }}
+
 
     # ============================================================
     # FINAL OUTPUT
