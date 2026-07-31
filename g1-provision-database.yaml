@@ -1,56 +1,147 @@
-# Credential: provisioner-user
-- name: Step 2 - Provision Database VM
+- name: Step 1 - Provision Namespace and Database VM
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
+    actual_user: "{{ awx_user_name }}"
+    billing_group: "group1"
     template_namespace: "template"
     ssh_user: "fedora"
 
   tasks:
+    # ============================================================
+    # VALIDATION
+    # ============================================================
+
+    - name: Pre-check - Ensure user identity is captured
+      ansible.builtin.fail:
+        msg: "User identity could not be determined."
+      when:
+        - actual_user is not defined or actual_user | trim == ""
+
     - name: Validate project_name
       ansible.builtin.fail:
         msg: "project_name is required."
       when:
         - project_name is not defined or project_name | trim == ""
 
-    - name: Validate actual_user
-      ansible.builtin.fail:
-        msg: "actual_user is required."
-      when:
-        - actual_user is not defined or actual_user | trim == ""
-
     - name: Validate dbtype
       ansible.builtin.fail:
         msg: "Invalid dbtype '{{ dbtype | default('undefined') }}'. Allowed values: postgresql13, mongodb83"
       when:
-        - dbtype is not defined or dbtype not in ['postgresql13', 'mongodb83']
+        - dbtype is not defined
+          or dbtype not in ['postgresql13', 'mongodb83']
+
+    # ============================================================
+    # NAMESPACE
+    # ============================================================
+
+    - name: Create Isolated Namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ project_name }}"
+            labels:
+              billing-group: "{{ billing_group }}"
+              provisioned-via: AAP-Portal
+            annotations:
+              openshift.io/requester: "{{ actual_user }}"
+
+    - name: Apply ResourceQuota
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: default-quota
+            namespace: "{{ project_name }}"
+          spec:
+            hard:
+              cpu: "10"
+              memory: 40Gi
+              requests.storage: 100Gi
+              count/virtualmachines.kubevirt.io: "2"
+
+    - name: Apply LimitRange
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: default-limits
+            namespace: "{{ project_name }}"
+          spec:
+            limits:
+              - type: Container
+                default:
+                  cpu: "2"
+                  memory: 4Gi
+                defaultRequest:
+                  cpu: "1"
+                  memory: 2Gi
+
+    # ============================================================
+    # PROJECT RBAC
+    # ============================================================
+
+    - name: Grant project admin permissions to requester
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-admin-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: user-project-admin
+          subjects:
+            - kind: User
+              name: "{{ actual_user }}"
+              apiGroup: rbac.authorization.k8s.io
+
+    - name: Grant project viewer permissions to billing group
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: project-group-viewer-binding
+            namespace: "{{ project_name }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: user-project-viewer
+          subjects:
+            - kind: Group
+              name: "{{ billing_group }}"
+              apiGroup: rbac.authorization.k8s.io
+
+    # ============================================================
+    # DATABASE TEMPLATE SELECTION
+    # ============================================================
 
     - name: Select database template
       ansible.builtin.set_fact:
-        selected_template: "{{ 'postgresql-13' if dbtype == 'postgresql13' else 'mongodb-83' }}"
+        selected_template: >-
+          {{
+            'postgresql-13'
+            if dbtype == 'postgresql13'
+            else 'mongodb-83'
+          }}
 
-    - name: Verify target namespace exists
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Namespace
-        name: "{{ project_name }}"
-      register: namespace_check
-
-    - name: Fail if target namespace does not exist
-      ansible.builtin.fail:
-        msg: "Namespace '{{ project_name }}' does not exist."
-      when:
-        - namespace_check.resources | length == 0
-
-    - name: Verify impersonated user can access target project
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Service
-        namespace: "{{ project_name }}"
-        impersonate_user: "{{ actual_user }}"
-      register: impersonation_check
+    # ============================================================
+    # SSH CREDENTIAL
+    # ============================================================
 
     - name: Generate SSH password
       ansible.builtin.set_fact:
@@ -65,7 +156,11 @@
           }}
       no_log: true
 
-    - name: Process selected OpenShift VM template
+    # ============================================================
+    # PROCESS OPENSHIFT TEMPLATE
+    # ============================================================
+
+    - name: Process selected database template
       ansible.builtin.command:
         argv:
           - oc
@@ -85,6 +180,10 @@
     - name: Capture generated VM name
       ansible.builtin.set_fact:
         vm_name: "{{ generated_vm.metadata.name }}"
+
+    # ============================================================
+    # CLOUD-INIT
+    # ============================================================
 
     - name: Build cloud-init user data
       ansible.builtin.set_fact:
@@ -115,13 +214,17 @@
             labels:
               app: "{{ vm_name }}"
               database-type: "{{ dbtype }}"
-              provisioned-via: "AAP-Portal"
+              provisioned-via: AAP-Portal
             annotations:
               openshift.io/requester: "{{ actual_user }}"
           type: Opaque
           stringData:
             userdata: "{{ cloud_init_userdata }}"
       no_log: true
+
+    # ============================================================
+    # BUILD FINAL VM
+    # ============================================================
 
     - name: Build final VM definition
       ansible.builtin.set_fact:
@@ -153,12 +256,14 @@
                             )
                             | combine(
                                 {
-                                  'vm.kubevirt.io/template.namespace': template_namespace
+                                  'vm.kubevirt.io/template.namespace':
+                                    template_namespace
                                 }
                               )
                         },
                         recursive=True
                       ),
+
                   'spec':
                     generated_vm.spec
                     | combine(
@@ -196,6 +301,7 @@
                                                 },
                                                 recursive=True
                                               ),
+
                                           'volumes':
                                             generated_vm.spec.template.spec.volumes
                                             +
@@ -204,7 +310,8 @@
                                                 'name': 'cloudinitdisk',
                                                 'cloudInitNoCloud': {
                                                   'userDataSecretRef': {
-                                                    'name': vm_name ~ '-cloudinit'
+                                                    'name':
+                                                      vm_name ~ '-cloudinit'
                                                   }
                                                 }
                                               }
@@ -224,12 +331,20 @@
           }}
       no_log: true
 
+    # ============================================================
+    # CREATE VM
+    # ============================================================
+
     - name: Create database VM as requesting user
       kubernetes.core.k8s:
         state: present
         impersonate_user: "{{ actual_user }}"
         definition: "{{ final_vm }}"
       no_log: true
+
+    # ============================================================
+    # WAIT FOR VM
+    # ============================================================
 
     - name: Wait until VM is ready
       kubernetes.core.k8s_info:
@@ -268,6 +383,10 @@
             | default('N/A')
           }}
 
+    # ============================================================
+    # SSH NODEPORT SERVICE
+    # ============================================================
+
     - name: Create SSH NodePort Service as requesting user
       kubernetes.core.k8s:
         state: present
@@ -281,7 +400,7 @@
             labels:
               app: "{{ vm_name }}"
               database-type: "{{ dbtype }}"
-              provisioned-via: "AAP-Portal"
+              provisioned-via: AAP-Portal
             annotations:
               openshift.io/requester: "{{ actual_user }}"
           spec:
@@ -303,10 +422,14 @@
         name: "{{ vm_name }}-ssh"
       register: ssh_service
 
-    - name: Capture Service information
+    - name: Capture SSH Service information
       ansible.builtin.set_fact:
         ssh_cluster_ip: "{{ ssh_service.resources[0].spec.clusterIP }}"
         ssh_node_port: "{{ ssh_service.resources[0].spec.ports[0].nodePort }}"
+
+    # ============================================================
+    # NODE ADDRESS
+    # ============================================================
 
     - name: Read VM node
       kubernetes.core.k8s_info:
@@ -326,6 +449,10 @@
               | list
             )[0]
           }}
+
+    # ============================================================
+    # FINAL OUTPUT
+    # ============================================================
 
     - name: Display database VM access information
       ansible.builtin.debug:
